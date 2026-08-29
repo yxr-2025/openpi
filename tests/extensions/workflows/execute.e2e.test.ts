@@ -27,6 +27,8 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { SPINNER_INTERVAL_MS } from "../../../extensions/shared/spinner.ts";
+import { reclaimWorktree } from "../../../extensions/shared/worktree.ts";
+import { persistWorkflowJson } from "../../../extensions/workflows/artifacts.ts";
 import type { WorkflowDetails } from "../../../extensions/workflows/model.ts";
 import type { WorkflowAgentSessionFactory } from "../../../extensions/workflows/runner.ts";
 
@@ -50,8 +52,12 @@ writeFileSync(join(repoDir, "fixture.txt"), "fixture\n");
 git(["add", "."]);
 git(["commit", "-q", "-m", "fixture"]);
 
-const { default: workflows, __setWorkflowTestAgentSessionFactory } =
-  await import("../../../extensions/workflows/index.ts");
+const {
+  default: workflows,
+  __setWorkflowTestAgentSessionFactory,
+  __setWorkflowTestLifecycleHooks,
+  shutdownActiveWorkflowRuns,
+} = await import("../../../extensions/workflows/index.ts");
 
 type CapturedTool = {
   name: string;
@@ -191,8 +197,9 @@ assert.match(String(sentMessages[0]?.message.content), /wf_1e9acbad/);
 sentMessages.length = 0;
 
 const workflow = tools.get("workflow")!;
+const workflowStop = tools.get("workflow_stop")!;
 const status = tools.get("workflow_status")!;
-assert.ok(workflow && status);
+assert.ok(workflow && workflowStop && status);
 
 function runDirFor(runId: unknown) {
   assert.equal(typeof runId, "string");
@@ -576,6 +583,151 @@ test("failed completion delivery remains durable and retries once with the same 
   );
 });
 
+test("shutdown preserves a failed completion for reload recovery", async () => {
+  sentMessages.length = 0;
+  modelIdle = false;
+  sendFailures = 1;
+  const run = (await workflow.execute(
+    "e2e-shutdown-reload-delivery",
+    {
+      script:
+        'export const meta = { name: "shutdown-reload-delivery" };\nreturn { durable: true };',
+      background: true,
+    },
+    undefined,
+    undefined,
+    ctx,
+  )) as { details: { runId?: unknown } };
+
+  await waitFor(
+    () =>
+      (readWorkflowJson(run.details.runId).delivery as { state?: string })
+        ?.state === "pending",
+    "pending completion before shutdown",
+  );
+  for (const handler of handlers.get("session_shutdown") ?? []) {
+    await handler({}, ctx);
+  }
+  assert.equal(
+    (readWorkflowJson(run.details.runId).delivery as { state?: string }).state,
+    "pending",
+  );
+
+  const reloadedHandlers = new Map<
+    string,
+    Array<(event: unknown, ctx: ExtensionContext) => unknown>
+  >();
+  const reloadedPi = {
+    ...pi,
+    registerTool() {},
+    on(event: string, handler: unknown) {
+      reloadedHandlers.set(event, [
+        ...(reloadedHandlers.get(event) ?? []),
+        handler as (event: unknown, ctx: ExtensionContext) => unknown,
+      ]);
+    },
+  } as unknown as ExtensionAPI;
+  workflows(reloadedPi);
+
+  modelIdle = true;
+  for (const handler of reloadedHandlers.get("session_start") ?? []) {
+    await handler({}, { ...ctx, mode: "print" } as unknown as ExtensionContext);
+  }
+  await waitFor(
+    () =>
+      sentMessages.filter(
+        (sent) => sent.message.details?.runId === run.details.runId,
+      ).length === 1,
+    "completion after reload recovery",
+  );
+  assert.equal(
+    (readWorkflowJson(run.details.runId).delivery as { state?: string }).state,
+    "delivered",
+  );
+
+  // The original instance represents the process that was replaced. Drain
+  // its intentionally retained in-memory retry so later tests do not batch it
+  // with an unrelated completion; the assertion above was reached solely via
+  // the fresh instance and persisted session state.
+  for (const handler of handlers.get("agent_settled") ?? []) {
+    await handler({}, ctx);
+  }
+  await waitFor(
+    () => sentMessages.length === 2,
+    "discarded predecessor instance retry",
+  );
+  sentMessages.length = 0;
+});
+
+test("cancelled detached delivery preserves aborted status after artifact persistence failure", async () => {
+  sentMessages.length = 0;
+  modelIdle = true;
+  let sessionCreated = false;
+  let releasePrompt = () => {};
+  const promptGate = new Promise<void>((resolve) => {
+    releasePrompt = resolve;
+  });
+  __setWorkflowTestAgentSessionFactory(async () => {
+    sessionCreated = true;
+    return { session: fakeAgentSession("cancelled output", promptGate) };
+  });
+
+  try {
+    const launch = (await workflow.execute(
+      "e2e-cancelled-persistence-failure",
+      {
+        script:
+          'export const meta = { name: "cancelled-persistence-failure" };\n' +
+          'return await agent("wait for cancellation", { agent_type: "reviewer" });',
+        background: true,
+      },
+      undefined,
+      undefined,
+      ctx,
+    )) as { details: { runId?: unknown } };
+    const runId = launch.details.runId;
+    const transcripts = join(runDirFor(runId), "transcripts.json");
+    await waitFor(
+      () => sessionCreated && existsSync(transcripts),
+      "active detached workflow before cancellation",
+    );
+
+    // Make the final artifact write fail after the cancellation path has
+    // selected `aborted`; terminal recovery can still rewrite workflow.json.
+    rmSync(transcripts);
+    mkdirSync(transcripts);
+    writeFileSync(join(transcripts, "blocker"), "keep directory non-empty\n");
+
+    await workflowStop.execute("e2e-cancel-stop", { runId });
+    releasePrompt();
+
+    await waitFor(
+      () => sentMessages.some((sent) => sent.message.details?.runId === runId),
+      "cancelled completion delivery",
+    );
+
+    const persisted = readWorkflowJson(runId);
+    assert.equal(persisted.status, "aborted");
+    assert.match(String(persisted.error), /Workflow was aborted/);
+    assert.match(String(persisted.error), /Artifact persistence failed/);
+
+    const delivered = sentMessages.find(
+      (sent) => sent.message.details?.runId === runId,
+    );
+    assert.ok(delivered);
+    const deliveredDetails = delivered.message.details as {
+      status?: unknown;
+      error?: unknown;
+    };
+    assert.equal(deliveredDetails.status, "aborted");
+    assert.match(String(deliveredDetails.error), /Workflow was aborted/);
+    assert.match(String(deliveredDetails.error), /Artifact persistence failed/);
+  } finally {
+    releasePrompt();
+    __setWorkflowTestAgentSessionFactory(undefined);
+  }
+});
+
 test("a failing script reports the error and records the run as failed", async () => {
   await assert.rejects(
     Promise.resolve(
@@ -840,6 +992,137 @@ test("an oversized legacy replay is rejected without a success record", async ()
     );
     assert.equal(existsSync(join(resumedDir, "journal.json")), false);
   } finally {
+    __setWorkflowTestAgentSessionFactory(undefined);
+  }
+});
+
+test("forced settlement persists worktree cleanup that finishes later", async () => {
+  modelIdle = true;
+  for (const handler of handlers.get("agent_settled") ?? []) {
+    await handler({}, ctx);
+  }
+  sentMessages.length = 0;
+  let activeRun:
+    | Parameters<typeof shutdownActiveWorkflowRuns>[0][number]
+    | undefined;
+  let markCleanupStarted = () => {};
+  let releaseCleanup = () => {};
+  const cleanupStarted = new Promise<void>((resolve) => {
+    markCleanupStarted = resolve;
+  });
+  const cleanupGate = new Promise<void>((resolve) => {
+    releaseCleanup = resolve;
+  });
+  let actualCleanup: Awaited<ReturnType<typeof reclaimWorktree>> | undefined;
+  let latePersistenceFailures = 0;
+
+  __setWorkflowTestAgentSessionFactory(async () => ({
+    session: fakeAgentSession("isolated agent output"),
+  }));
+  __setWorkflowTestLifecycleHooks({
+    persistWorkflow(runDir, details, journal) {
+      if (
+        latePersistenceFailures === 0 &&
+        details.status === "failed" &&
+        details.agents.some((agent) => agent.worktreeCleanup !== undefined)
+      ) {
+        latePersistenceFailures++;
+        throw new Error("injected late cleanup persistence failure");
+      }
+      persistWorkflowJson(runDir, details, journal);
+    },
+    onRunStarted(run) {
+      activeRun = run;
+    },
+    async reclaimWorktree(repoCwd, worktree) {
+      markCleanupStarted();
+      await cleanupGate;
+      actualCleanup = await reclaimWorktree(repoCwd, worktree);
+      return actualCleanup;
+    },
+  });
+
+  try {
+    const launch = (await workflow.execute(
+      "e2e-forced-worktree-cleanup",
+      {
+        script:
+          'export const meta = { name: "forced-worktree-cleanup" };\n' +
+          'await agent("finish in isolation", { agent_type: "reviewer", isolation: "worktree" });\n' +
+          "return true;",
+        background: true,
+      },
+      undefined,
+      undefined,
+      ctx,
+    )) as { details: { runId?: unknown } };
+
+    await cleanupStarted;
+    assert.ok(activeRun);
+    assert.equal(await shutdownActiveWorkflowRuns([activeRun], 10), false);
+
+    const forced = readWorkflowJson(launch.details.runId);
+    assert.equal(forced.status, "failed");
+    const forcedAgent = (forced.agents as Array<Record<string, unknown>>)[0];
+    assert.equal(forcedAgent?.worktreeCleanup, undefined);
+
+    releaseCleanup();
+    await activeRun.completion;
+    assert.ok(actualCleanup);
+    assert.equal(latePersistenceFailures, 1);
+
+    const deliveriesForRun = () =>
+      sentMessages.filter((sent) =>
+        String(sent.message.content).includes(
+          `(${String(launch.details.runId)})`,
+        ),
+      );
+    await waitFor(
+      () => deliveriesForRun().length === 1,
+      "forced settlement completion delivery",
+    );
+
+    const persisted = readWorkflowJson(launch.details.runId);
+    assert.equal(persisted.status, "failed");
+    assert.match(String(persisted.error), /Session shutdown deadline exceeded/);
+    assert.match(
+      String(persisted.error),
+      /Artifact persistence failed: injected late cleanup persistence failure/,
+    );
+    const agent = (persisted.agents as Array<Record<string, unknown>>)[0];
+    assert.deepEqual(agent?.worktreeCleanup, actualCleanup);
+    assert.equal(
+      agent?.worktreeBranch,
+      actualCleanup.branchDeleted ? undefined : actualCleanup.branch,
+    );
+    if (actualCleanup.removed) assert.equal(agent?.worktreePath, undefined);
+    assert.equal(typeof agent?.worktreeHandoffArtifact, "string");
+    const delivery = persisted.delivery as Record<string, unknown>;
+    assert.equal(
+      delivery.id,
+      `workflow:${String(launch.details.runId)}:terminal`,
+    );
+    assert.equal(delivery.state, "delivered");
+    assert.equal(delivery.attempts, 1);
+    assert.equal(typeof delivery.updatedAt, "number");
+    assert.equal(typeof delivery.deliveredAt, "number");
+
+    const delivered = deliveriesForRun()[0];
+    assert.ok(delivered);
+    assert.match(String(delivered.message.content), /failed/);
+    assert.match(
+      String(delivered.message.content),
+      /Session shutdown deadline exceeded/,
+    );
+
+    for (const handler of handlers.get("agent_settled") ?? []) {
+      await handler({}, ctx);
+    }
+    assert.equal(deliveriesForRun().length, 1);
+  } finally {
+    releaseCleanup();
+    if (activeRun?.completion) await activeRun.completion.catch(() => {});
+    __setWorkflowTestLifecycleHooks(undefined);
     __setWorkflowTestAgentSessionFactory(undefined);
   }
 });

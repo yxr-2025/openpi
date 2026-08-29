@@ -86,6 +86,7 @@ import {
   loadJournal,
   persistWorkflowAgentResult,
   persistWorkflowJson,
+  persistWorkflowTerminalState,
 } from "./artifacts.ts";
 import {
   buildExpandedWorkflowCompletion,
@@ -640,6 +641,17 @@ function writeRunFile(runDir: string, name: string, content: string) {
   writeFileAtomic(path.join(runDir, name), content);
 }
 
+function appendArtifactPersistenceFailure(
+  details: WorkflowDetails,
+  error: unknown,
+) {
+  const persistenceFailure = `Artifact persistence failed: ${errorText(error)}`;
+  if (details.status !== "aborted") details.status = "failed";
+  details.error = details.error
+    ? `${details.error}; ${persistenceFailure}`
+    : persistenceFailure;
+}
+
 function compactToolDetails(details: WorkflowDetails): WorkflowDetails {
   return {
     ...details,
@@ -659,6 +671,21 @@ export interface ActiveWorkflowRunLifecycle {
   controller: Pick<RunController, "abort" | "settle">;
   completion?: Promise<void>;
   forceSettle(error: string): void;
+}
+
+interface WorkflowLifecycleTestHooks {
+  readonly persistWorkflow?: typeof persistWorkflowJson;
+  readonly reclaimWorktree?: typeof reclaimWorktree;
+  readonly onRunStarted?: (run: ActiveWorkflowRunLifecycle) => void;
+}
+
+let workflowLifecycleTestHooks: WorkflowLifecycleTestHooks | undefined;
+
+/** Test-only control for deterministic lifecycle race coverage. */
+export function __setWorkflowTestLifecycleHooks(
+  hooks: WorkflowLifecycleTestHooks | undefined,
+) {
+  workflowLifecycleTestHooks = hooks;
 }
 
 /** Abort every live child and bound the whole session-shutdown barrier once. */
@@ -1044,6 +1071,10 @@ export default function workflows(pi: ExtensionAPI) {
       navigationLayerRegistered = false;
     }
     await shutdownActiveWorkflowRuns([...activeRuns.values()]);
+    // Give deferred completions one final delivery attempt. Failed sends stay
+    // durably pending; clearing first would discard an envelope whose initial
+    // persistence may have failed.
+    await resultDelivery.parentSettled();
     try {
       lastContext?.ui.setStatus("workflows", undefined);
       lastContext?.ui.setWidget(widgetKey, undefined);
@@ -1054,7 +1085,6 @@ export default function workflows(pi: ExtensionAPI) {
     widgetVisible = false;
     requestWidgetRender = undefined;
     stripState.focused = false;
-    resultDelivery.clear();
   });
 
   pi.registerCommand("workflows", {
@@ -1210,6 +1240,9 @@ export default function workflows(pi: ExtensionAPI) {
       persistWorkflowJson(runDir, details);
       const persistence = createWorkflowPersistence(runDir, details, {
         journal: () => journalEntries,
+        ...(workflowLifecycleTestHooks?.persistWorkflow
+          ? { persist: workflowLifecycleTestHooks.persistWorkflow }
+          : {}),
       });
 
       // A caller wait never owns the run. All runs survive an interrupted
@@ -1271,6 +1304,15 @@ export default function workflows(pi: ExtensionAPI) {
         flush(terminal);
       };
 
+      const persistTerminalRecovery = () => {
+        try {
+          persistWorkflowTerminalState(runDir, details);
+        } catch {
+          // The original persistence error remains authoritative; restart
+          // reconciliation handles the remaining uncertainty.
+        }
+      };
+
       const terminalize = (
         status: WorkflowDetails["status"],
         error?: string,
@@ -1323,7 +1365,8 @@ export default function workflows(pi: ExtensionAPI) {
         try {
           persistence.flush();
         } catch (persistenceError) {
-          details.error = `${error}; artifact persistence failed: ${errorText(persistenceError)}`;
+          appendArtifactPersistenceFailure(details, persistenceError);
+          persistTerminalRecovery();
         }
         flushNow(true);
       };
@@ -2027,7 +2070,10 @@ export default function workflows(pi: ExtensionAPI) {
                     detached: false,
                   };
                 } else {
-                  cleanup = await reclaimWorktree(ctx.cwd, worktree).catch(
+                  const reclaimer =
+                    workflowLifecycleTestHooks?.reclaimWorktree ??
+                    reclaimWorktree;
+                  cleanup = await reclaimer(ctx.cwd, worktree).catch(
                     (error): WorktreeCleanup => ({
                       removed: false,
                       branchDeleted: false,
@@ -2049,13 +2095,21 @@ export default function workflows(pi: ExtensionAPI) {
                     };
                   }
                 }
-                if (!runSettled) {
-                  record.worktreeCleanup = cleanup;
-                  if (cleanup.branchDeleted) delete record.worktreeBranch;
-                  else record.worktreeBranch = cleanup.branch;
-                  if (!cleanup.removed) record.worktreePath = worktree.path;
-                  emit();
-                }
+                record.worktreeCleanup = cleanup;
+                if (cleanup.branchDeleted) delete record.worktreeBranch;
+                else record.worktreeBranch = cleanup.branch;
+                if (!cleanup.removed) record.worktreePath = worktree.path;
+                // Forced settlement fixes the execution verdict, but cleanup
+                // provenance discovered afterward still belongs in the run.
+                // No later final flush remains, so failures must be observable.
+                if (runSettled) {
+                  try {
+                    persistence.flush();
+                  } catch (error) {
+                    appendArtifactPersistenceFailure(details, error);
+                    persistTerminalRecovery();
+                  }
+                } else emit();
               }
             }
           }, invocationSignal)
@@ -2109,8 +2163,8 @@ export default function workflows(pi: ExtensionAPI) {
         try {
           persistence.flush();
         } catch (error) {
-          details.status = "failed";
-          details.error = `Artifact persistence failed: ${errorText(error)}`;
+          appendArtifactPersistenceFailure(details, error);
+          persistTerminalRecovery();
           throw new Error(details.error);
         } finally {
           flushNow(true);
@@ -2127,6 +2181,7 @@ export default function workflows(pi: ExtensionAPI) {
       activeRuns.set(runId, activeRun);
       const completion = runScript();
       activeRun.completion = completion;
+      workflowLifecycleTestHooks?.onRunStarted?.(activeRun);
       if (ctx.hasUI) lastContext = ctx;
       updateIndicator();
 
@@ -2140,8 +2195,8 @@ export default function workflows(pi: ExtensionAPI) {
         try {
           await completion;
         } catch (error) {
-          details.status = "failed";
-          details.finishedAt = Date.now();
+          if (details.status === "running") details.status = "failed";
+          details.finishedAt ??= Date.now();
           details.error = details.error ?? errorText(error);
         } finally {
           recordTerminalRun();
