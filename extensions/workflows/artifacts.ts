@@ -127,7 +127,7 @@ export function persistWorkflowAgentResult(
   index: number,
   result: { output: string; structured?: unknown },
 ) {
-  const artifact = path.join(
+  const artifact = path.posix.join(
     "agent-results",
     `agent-${String(index).padStart(4, "0")}.json`,
   );
